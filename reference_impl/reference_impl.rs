@@ -162,6 +162,7 @@ impl Output {
     }
 }
 
+#[derive(Clone)]
 struct ChunkState {
     chaining_value: [u32; 8],
     chunk_counter: u64,
@@ -264,6 +265,7 @@ fn parent_cv(
 }
 
 /// An incremental hasher that can accept any number of writes.
+#[derive(Clone)]
 pub struct Hasher {
     chunk_state: ChunkState,
     key_words: [u32; 8],
@@ -370,5 +372,138 @@ impl Hasher {
             );
         }
         output.root_output_bytes(out_slice);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Hasher;
+
+    #[test]
+    fn test_regular_hashing() {
+        // Regular hashing is fastest, but it can be broken. Use either keyed hash or KDF mode
+
+        let mut hasher = Hasher::new();
+        hasher.update(b"abc");
+        hasher.update(b"def");
+        let mut hash = [0; 32];
+        hasher.finalize(&mut hash);
+        assert_eq!(hash, [179, 75, 86, 7, 103, 18, 253, 127, 185, 192, 103, 36, 90, 108, 133, 225, 97, 116, 179, 239, 46, 53, 223, 123, 86, 183, 241, 100, 229, 195, 100, 70]);
+    }
+
+    #[test]
+    fn test_keyed_hash() {
+        // if you have good random key (ideally generated with some hardware),
+        // then you can use keyed hash for better security at zero-cost.
+        // Performance is comparable to the regular hashing
+
+        let mut key = [0u8; 32];
+        getrandom::fill(&mut key).unwrap();
+
+        let mut hasher = Hasher::new_keyed(&key);
+        hasher.update(b"abc");
+        hasher.update(b"def");
+        let mut hash = [0; 32];
+        hasher.finalize(&mut hash);
+    }
+
+    #[test]
+    fn test_key_derivation() {
+        // if you don't have good random key then you can use Blake3 in derive key (KDF) mode.
+        // Performance is worse than regular or keyed hash, but at least it is still secure
+
+        let mut hasher = Hasher::new_derive_key("ix 2025-01-01 16:18:03 content-addressing v1");
+        hasher.update(b"abc");
+        hasher.update(b"def");
+        let mut hash = [0; 32];
+        hasher.finalize(&mut hash);
+        assert_eq!(hash, [202, 191, 106, 82, 121, 36, 179, 255, 21, 88, 219, 224, 206, 36, 17, 191, 95, 33, 221, 4, 106, 88, 243, 95, 253, 72, 238, 201, 22, 130, 4, 207])
+    }
+
+    #[test]
+    fn test_extendable_output() {
+        // By default Blake3 outputs 32-bytes hash, but you can also specify arbitrary size of the output
+
+        let mut hasher = Hasher::new_derive_key("ix 2025-01-01 16:18:03 content-addressing v1");
+        hasher.update(b"abc");
+        hasher.update(b"def");
+        let mut hash = [0; 64];
+        hasher.finalize(&mut hash);
+
+        assert_eq!(
+            hash,
+            [
+                202, 191, 106, 82, 121, 36, 179, 255, 21, 88, 219, 224, 206, 36, 17, 191, 95, 33, 221, 4, 106, 88, 243, 95, 253, 72, 238, 201, 22, 130, 4, 207, 65, 18, 16, 248, 192, 22, 98, 134, 47, 217, 25, 37, 159, 66, 117, 8, 99, 40, 224, 72, 209, 240, 199, 21, 204, 129, 235, 143, 70, 235, 25, 229
+            ]
+        )
+    }
+
+    // Defines max size in bytes of a single absorb
+    const ABSORB_MAX_BYTES: usize = u32::MAX as usize;
+
+    // Defines how many absorbs can happen without re-keying
+    const DEFAULT_REKEYING_STAGE: usize = u16::MAX as usize;
+
+    #[derive(Clone)]
+    struct Blake3Sponge {
+        hasher: Hasher,
+        abosrb_counter: usize,
+    }
+
+    impl Blake3Sponge {
+        fn init(domain_separation_label: &str) -> Blake3Sponge {
+            assert!(domain_separation_label.len() > 0);
+            let hasher = Hasher::new_derive_key(domain_separation_label);
+            Blake3Sponge {
+                hasher,
+                abosrb_counter: 0usize
+            }
+        }
+
+        // Using ABSORB_MAX_BYTES and DEFAULT_REKEYING_STAGE limits allow controlling how
+        // much preimage -> hash material is available to an attacker
+        fn absorb(&mut self, bytes: &[u8]) {
+            assert!(bytes.len() < ABSORB_MAX_BYTES);
+            if self.abosrb_counter >= DEFAULT_REKEYING_STAGE {
+                self.ratchet();
+            }
+            self.hasher.update(bytes);
+            self.abosrb_counter += 1;
+        }
+
+        // The idea of re-keying of the inner Hasher helps with preventing an attacker from collecting
+        // preimage -> hash material useful for cryptanalysis. Explicit ratcheting gives more control
+        // on a process of re-keying to the high-level caller.
+        fn ratchet(&mut self) {
+            let mut key = [0u8; 32];
+            self.hasher.finalize(&mut key);
+            self.hasher = Hasher::new_keyed(&key);
+        }
+
+        fn squeeze(&mut self, length: usize) -> Vec<u8> {
+            let mut hash = vec![0u8; 64 + length];
+            self.hasher.finalize(&mut hash);
+
+            // we skip first 64 bytes of the output in order to conceal the 'ratchet' key
+            hash[64..].to_vec()
+        }
+    }
+
+    #[test]
+    fn test_blake3_sponge() {
+        let mut sponge = Blake3Sponge::init("ix 2025-01-01 16:18:03 content-addressing v1");
+        sponge.absorb(&[0x01]);
+        sponge.absorb(&[0x02]);
+        sponge.absorb(&[0x03]);
+        sponge.absorb(&[0x04, 0x05]);
+
+        // Calling 'ratchet' explicitly is optional. It is only relevant if we try to maximize performance,
+        // by setting ABSORB_MAX_BYTES and DEFAULT_REKEYING_STAGE to a maximum values and leaving ratcheting
+        // entirely up to a caller.
+
+        // sponge.ratchet()
+
+        let output = sponge.squeeze(50);
+        assert_eq!(output, [21, 150, 121, 38, 177, 21, 33, 148, 213, 127, 208, 231, 200, 18, 46, 115, 244, 188, 245, 188, 176, 29, 43, 123, 135, 148, 132, 218, 45, 244, 127, 103, 178, 82, 145, 67, 43, 106, 204, 137, 154, 99, 175, 9, 196, 102, 126, 72, 27, 86]);
     }
 }
